@@ -22,6 +22,23 @@ interface MeetingRoomProps {
   onEndMeeting?: () => void;
 }
 
+// Gracefully filter benign WebRTC DataChannel teardown notices from triggering Next.js dev overlay
+if (typeof window !== "undefined" && !(window as any).__hasFilteredLiveKitError) {
+  (window as any).__hasFilteredLiveKitError = true;
+  const originalError = console.error;
+  console.error = function (...args: any[]) {
+    const first = typeof args[0] === "string" ? args[0] : "";
+    if (
+      first.includes("DataChannel error on lossy: User-Initiated Abort") ||
+      first.includes("User-Initiated Abort")
+    ) {
+      console.debug(...args);
+      return;
+    }
+    originalError.apply(console, args);
+  };
+}
+
 export const MeetingRoom: React.FC<MeetingRoomProps> = ({
   negotiationId,
   candidateName,
@@ -63,6 +80,12 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({
   const restartTimerRef = useRef<any>(null);
   const handleProcessCandidateMessageRef = useRef<any>(null);
   const stopAllAudioRef = useRef<any>(null);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const audioChunksRef = useRef<Blob[]>([]);
+  const isRecordingVoiceRef = useRef<boolean>(false);
+  const vadSilenceTimerRef = useRef<any>(null);
+  const [isTranscribing, setIsTranscribing] = useState(false);
+  const [isManualRecording, setIsManualRecording] = useState(false);
 
   // Client-side sanitization: Guarantees raw JSON or "thought" never leaks to screen or voice
   const cleanCaptionAndVoice = useCallback((text: string): string => {
@@ -106,14 +129,19 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({
     setIsAiSpeaking(false);
   }, []);
 
-  // Fallback Web Speech Synthesis (Fast 1.35x rate with professional Indian English voice)
+  // Fallback Web Speech Synthesis (Fast 1.35x rate with best available voice)
   const fallbackBrowserTTS = useCallback(
     (rawText: string) => {
       const text = cleanCaptionAndVoice(rawText);
+      if (!text) return;
+
+      // 1. Stop any existing audio first
+      stopAllAudio();
+
+      // 2. Assign the session ID AFTER stopAllAudio to avoid mismatch
       const sessionId = ++activeAudioSessionIdRef.current;
 
       if (typeof window !== "undefined" && "speechSynthesis" in window) {
-        stopAllAudio();
         isAudioLockedRef.current = true;
         setIsAiSpeaking(true);
 
@@ -127,21 +155,27 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({
         // Fast conversational pace (1.35x)
         utterance.rate = 1.35;
         utterance.pitch = 1.0;
-        utterance.lang = "en-IN";
 
         const voices = window.speechSynthesis.getVoices();
-        const indianVoice = voices.find(
-          (v) =>
-            v.lang === "en-IN" ||
-            v.lang === "en_IN" ||
-            v.name.toLowerCase().includes("india") ||
-            v.name.toLowerCase().includes("neerja") ||
-            v.name.toLowerCase().includes("heera") ||
-            v.name.toLowerCase().includes("prabhat") ||
-            v.name.toLowerCase().includes("ravi")
-        );
-        if (indianVoice) {
-          utterance.voice = indianVoice;
+        const preferredVoice =
+          voices.find(
+            (v) =>
+              v.lang === "en-IN" ||
+              v.lang === "en_IN" ||
+              v.name.toLowerCase().includes("india") ||
+              v.name.toLowerCase().includes("neerja") ||
+              v.name.toLowerCase().includes("heera") ||
+              v.name.toLowerCase().includes("prabhat") ||
+              v.name.toLowerCase().includes("ravi")
+          ) ||
+          voices.find((v) => v.lang.startsWith("en")) ||
+          voices[0];
+
+        if (preferredVoice) {
+          utterance.voice = preferredVoice;
+          utterance.lang = preferredVoice.lang;
+        } else {
+          utterance.lang = "en-US";
         }
 
         // Keep anchor on window to prevent V8 garbage collector from dropping onend event
@@ -149,10 +183,12 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({
 
         // Auto-release safety timer in case Chrome onend is delayed
         if (speechSafetyTimerRef.current) clearTimeout(speechSafetyTimerRef.current);
-        const estDuration = Math.max(2500, (text.split(" ").length / 2.5) * 1000 + 1000);
+        const estDuration = Math.max(3000, (text.split(" ").length / 2.5) * 1000 + 2000);
         speechSafetyTimerRef.current = setTimeout(() => {
-          setIsAiSpeaking(false);
-          isAudioLockedRef.current = false;
+          if (sessionId === activeAudioSessionIdRef.current) {
+            setIsAiSpeaking(false);
+            isAudioLockedRef.current = false;
+          }
         }, estDuration);
 
         utterance.onend = () => {
@@ -162,7 +198,8 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({
             isAudioLockedRef.current = false;
           }
         };
-        utterance.onerror = () => {
+        utterance.onerror = (e) => {
+          console.warn("Speech synthesis notice:", e);
           if (speechSafetyTimerRef.current) clearTimeout(speechSafetyTimerRef.current);
           if (sessionId === activeAudioSessionIdRef.current) {
             setIsAiSpeaking(false);
@@ -170,6 +207,7 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({
           }
         };
 
+        window.speechSynthesis.resume();
         window.speechSynthesis.speak(utterance);
       } else {
         setTimeout(() => {
@@ -183,29 +221,34 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({
     [stopAllAudio, cleanCaptionAndVoice]
   );
 
-  // Play voice through VerbX TTS at 1.35x speed with strict single-voice lock & 2s timeout
+  // Play voice through VerbX TTS at 1.35x speed with strict single-voice lock & fallback
   const playAiVoice = useCallback(
     async (rawText: string) => {
       const text = cleanCaptionAndVoice(rawText);
-      const sessionId = ++activeAudioSessionIdRef.current;
+      if (!text) return;
 
-      // Step 1: Kill any previously playing audio immediately
+      // 1. Kill any previously playing audio FIRST
       stopAllAudio();
+
+      // 2. Assign the active session ID AFTER stopAllAudio to avoid mismatch
+      const sessionId = ++activeAudioSessionIdRef.current;
 
       isAudioLockedRef.current = true;
       setIsAiSpeaking(true);
 
       // Auto-release safety timer in case audio playback stalls
       if (speechSafetyTimerRef.current) clearTimeout(speechSafetyTimerRef.current);
-      const estDuration = Math.max(2500, (text.split(" ").length / 2.5) * 1000 + 1500);
+      const estDuration = Math.max(3000, (text.split(" ").length / 2.5) * 1000 + 2000);
       speechSafetyTimerRef.current = setTimeout(() => {
-        setIsAiSpeaking(false);
-        isAudioLockedRef.current = false;
+        if (sessionId === activeAudioSessionIdRef.current) {
+          setIsAiSpeaking(false);
+          isAudioLockedRef.current = false;
+        }
       }, estDuration);
 
-      // Fast 2-second timeout to prevent any hanging cold start
+      // Fast 3-second timeout for server TTS fetch
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 2000);
+      const timeoutId = setTimeout(() => controller.abort(), 3000);
 
       try {
         const ttsRes = await fetch("/api/verbx/tts", {
@@ -222,16 +265,22 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({
         }
 
         if (ttsRes.ok) {
-          const contentType = ttsRes.headers.get("content-type");
-          if (contentType && (contentType.includes("audio") || contentType.includes("ogg") || contentType.includes("mpeg"))) {
+          const contentType = ttsRes.headers.get("content-type") || "";
+          if (
+            contentType.includes("audio") ||
+            contentType.includes("ogg") ||
+            contentType.includes("mpeg") ||
+            contentType.includes("octet-stream")
+          ) {
             const blob = await ttsRes.blob();
             if (sessionId !== activeAudioSessionIdRef.current || !isMountedRef.current) {
               return;
             }
 
-            if (blob.size > 200) {
+            if (blob.size > 100) {
               const audioUrl = URL.createObjectURL(blob);
-              const audio = new Audio(audioUrl);
+              const audio = new Audio();
+              audio.src = audioUrl;
 
               // 1.35x fast conversational speaking rate with pitch lock
               audio.playbackRate = 1.35;
@@ -249,7 +298,8 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({
                 currentAudioRef.current = null;
               };
 
-              audio.onerror = () => {
+              audio.onerror = (e) => {
+                console.warn("Audio element notice, falling back to speech synthesis:", e);
                 if (speechSafetyTimerRef.current) clearTimeout(speechSafetyTimerRef.current);
                 currentAudioRef.current = null;
                 if (sessionId === activeAudioSessionIdRef.current) {
@@ -322,6 +372,22 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({
 
   // Connect to LiveKit
   const connectLiveKit = useCallback(async (stream: MediaStream | null) => {
+    // If room is already active or connecting, reuse it without creating duplicate peer connections
+    if (livekitRoomRef.current) {
+      if (
+        livekitRoomRef.current.state === ConnectionState.Connected ||
+        livekitRoomRef.current.state === ConnectionState.Connecting
+      ) {
+        if (stream && livekitRoomRef.current.state === ConnectionState.Connected) {
+          const videoTrack = stream.getVideoTracks()[0];
+          const audioTrack = stream.getAudioTracks()[0];
+          if (videoTrack) await livekitRoomRef.current.localParticipant.publishTrack(videoTrack).catch(() => {});
+          if (audioTrack) await livekitRoomRef.current.localParticipant.publishTrack(audioTrack).catch(() => {});
+        }
+        return;
+      }
+    }
+
     try {
       const res = await fetch(`/api/livekit/token?negotiationId=${negotiationId}&type=candidate`);
       if (!res.ok) return;
@@ -364,6 +430,13 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({
       if (lastProcessedTextRef.current === cleaned) return;
       lastProcessedTextRef.current = cleaned;
 
+      // Reset duplicate guard after 4 seconds so candidate can re-state a number if desired
+      setTimeout(() => {
+        if (lastProcessedTextRef.current === cleaned) {
+          lastProcessedTextRef.current = "";
+        }
+      }, 4000);
+
       // Stop any AI speech immediately when candidate speaks/submits
       stopAllAudio();
 
@@ -379,10 +452,18 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({
         await playAiVoice(aiReply);
       } catch (err: any) {
         console.error("Pipeline message processing error:", err);
-        setAiCaption("Could you please repeat your expectation?");
+        const fallbackReply = "I understand your perspective. Could you share more details on your compensation breakdown?";
+        setAiCaption(fallbackReply);
+        await playAiVoice(fallbackReply);
       } finally {
         isBusyProcessingRef.current = false;
         setIsProcessing(false);
+        // Seamlessly resume listening for candidate's counter-offer
+        setTimeout(() => {
+          if (shouldListenRef.current && isMountedRef.current) {
+            startRecognitionSession();
+          }
+        }, 300);
       }
     },
     [negotiationId, playAiVoice, cleanCaptionAndVoice, stopAllAudio]
@@ -392,7 +473,98 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({
   handleProcessCandidateMessageRef.current = handleProcessCandidateMessage;
   stopAllAudioRef.current = stopAllAudio;
 
-  // Real-time hardware microphone volume meter via Web Audio API
+  // Hardware MediaRecorder for Direct Voice Transcription via /api/verbx/stt
+  const startVoiceRecording = useCallback(() => {
+    if (!localStreamRef.current || isRecordingVoiceRef.current || isBusyProcessingRef.current) return;
+    const audioTracks = localStreamRef.current.getAudioTracks();
+    if (audioTracks.length === 0 || !audioTracks[0].enabled) return;
+
+    try {
+      audioChunksRef.current = [];
+      let mimeType = "";
+      if (typeof MediaRecorder !== "undefined") {
+        if (MediaRecorder.isTypeSupported("audio/webm;codecs=opus")) {
+          mimeType = "audio/webm;codecs=opus";
+        } else if (MediaRecorder.isTypeSupported("audio/webm")) {
+          mimeType = "audio/webm";
+        } else if (MediaRecorder.isTypeSupported("audio/ogg")) {
+          mimeType = "audio/ogg";
+        }
+      }
+
+      const recorder = mimeType
+        ? new MediaRecorder(localStreamRef.current, { mimeType })
+        : new MediaRecorder(localStreamRef.current);
+
+      recorder.ondataavailable = (e) => {
+        if (e.data && e.data.size > 0) {
+          audioChunksRef.current.push(e.data);
+        }
+      };
+
+      recorder.onstop = async () => {
+        isRecordingVoiceRef.current = false;
+        setIsManualRecording(false);
+        const blob = new Blob(audioChunksRef.current, { type: recorder.mimeType || "audio/webm" });
+        if (blob.size < 1200) return; // Discard tiny noise clicks
+
+        setIsTranscribing(true);
+        try {
+          const reader = new FileReader();
+          reader.readAsDataURL(blob);
+          reader.onloadend = async () => {
+            const rawBase64 = reader.result as string;
+            const base64Audio = rawBase64.includes(",") ? rawBase64.split(",")[1] : rawBase64;
+            if (!base64Audio) {
+              setIsTranscribing(false);
+              return;
+            }
+
+            const res = await fetch("/api/verbx/stt", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ audio_base64: base64Audio }),
+            });
+
+            if (res.ok) {
+              const data = await res.json();
+              const transcribed = data?.text?.trim();
+              if (transcribed && transcribed.length >= 2) {
+                setCandidateCaption(transcribed);
+                handleProcessCandidateMessageRef.current?.(transcribed);
+              }
+            }
+            setIsTranscribing(false);
+          };
+        } catch (err) {
+          console.warn("Direct STT transcription notice:", err);
+          setIsTranscribing(false);
+        }
+      };
+
+      recorder.start(100);
+      mediaRecorderRef.current = recorder;
+      isRecordingVoiceRef.current = true;
+    } catch (err) {
+      console.warn("Hardware MediaRecorder start notice:", err);
+    }
+  }, []);
+
+  const stopVoiceRecording = useCallback(() => {
+    if (vadSilenceTimerRef.current) {
+      clearTimeout(vadSilenceTimerRef.current);
+      vadSilenceTimerRef.current = null;
+    }
+    if (mediaRecorderRef.current && isRecordingVoiceRef.current) {
+      try {
+        mediaRecorderRef.current.stop();
+      } catch {}
+    }
+    isRecordingVoiceRef.current = false;
+    setIsManualRecording(false);
+  }, []);
+
+  // Real-time hardware microphone volume meter & auto VAD via Web Audio API
   useEffect(() => {
     if (!localStream || !micEnabled || !hasStarted) {
       setAudioLevel(0);
@@ -434,9 +606,29 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({
         const normalized = Math.min(100, Math.round((avg / 128) * 100));
         setAudioLevel(normalized);
 
-        // If candidate speaks aloud while AI is talking, interrupt AI immediately!
-        if (normalized > 18 && isAiSpeaking) {
+        // Hardware Voice Activity Detection (VAD) from actual microphone hardware!
+        if (normalized > 16 && !isAiSpeaking && !isBusyProcessingRef.current) {
+          // Candidate is speaking aloud!
           stopAllAudioRef.current?.();
+          setIsCandidateSpeaking(true);
+
+          if (!isRecordingVoiceRef.current) {
+            startVoiceRecording();
+          }
+
+          if (vadSilenceTimerRef.current) {
+            clearTimeout(vadSilenceTimerRef.current);
+            vadSilenceTimerRef.current = null;
+          }
+        } else if (isRecordingVoiceRef.current && normalized <= 12 && !isManualRecording) {
+          // Candidate finished speaking: after 850ms silence, stop recorder and transcribe!
+          if (!vadSilenceTimerRef.current) {
+            vadSilenceTimerRef.current = setTimeout(() => {
+              setIsCandidateSpeaking(false);
+              stopVoiceRecording();
+              vadSilenceTimerRef.current = null;
+            }, 850);
+          }
         }
 
         animId = requestAnimationFrame(checkVolume);
@@ -460,28 +652,118 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({
         } catch {}
       }
     };
-  }, [localStream, micEnabled, hasStarted, isAiSpeaking]);
+  }, [localStream, micEnabled, hasStarted, isAiSpeaking, isManualRecording, startVoiceRecording, stopVoiceRecording]);
 
-  // Safe Start & Stop controllers for Speech Recognition
-  const startListening = useCallback(() => {
-    if (!recognitionRef.current || isRecognizingRef.current || !shouldListenRef.current) {
+  // Robust Speech Recognition Controller (uses fast per-utterance sessions with instant auto-restart)
+  const startRecognitionSession = useCallback(() => {
+    if (!shouldListenRef.current || !isMountedRef.current || isBusyProcessingRef.current) {
       return;
     }
+
+    const SpeechRecognition =
+      typeof window !== "undefined" && ((window as any).SpeechRecognition || (window as any).webkitSpeechRecognition);
+
+    if (!SpeechRecognition) {
+      setSpeechError("Speech recognition not supported in this browser. Please type in the input below.");
+      return;
+    }
+
+    // Cleanly abort previous instance if any
+    if (recognitionRef.current) {
+      try {
+        recognitionRef.current.onstart = null;
+        recognitionRef.current.onresult = null;
+        recognitionRef.current.onerror = null;
+        recognitionRef.current.onend = null;
+        recognitionRef.current.abort();
+      } catch {}
+      recognitionRef.current = null;
+    }
+
     try {
-      recognitionRef.current.start();
-      isRecognizingRef.current = true;
-      setIsListening(true);
-    } catch (err: any) {
-      if (err?.name === "InvalidStateError") {
-        isRecognizingRef.current = true;
+      const recognition = new SpeechRecognition();
+      // continuous = false prevents Chrome from hanging/buffering audio chunks on Windows
+      recognition.continuous = false;
+      recognition.interimResults = true;
+      recognition.maxAlternatives = 1;
+      recognition.lang =
+        typeof navigator !== "undefined" && navigator.language ? navigator.language : "en-US";
+
+      recognition.onstart = () => {
         setIsListening(true);
-      } else {
-        console.warn("Speech recognition start notice:", err);
-      }
+        setSpeechError(null);
+      };
+
+      recognition.onresult = (event: any) => {
+        if (isBusyProcessingRef.current) return;
+
+        let interim = "";
+        let final = "";
+
+        for (let i = event.resultIndex; i < event.results.length; ++i) {
+          const transcript = event.results[i][0].transcript;
+          if (event.results[i].isFinal) {
+            final += transcript;
+          } else {
+            interim += transcript;
+          }
+        }
+
+        const candidateText = (final || interim).trim();
+        if (candidateText && candidateText.length >= 2) {
+          // Immediately silence AI when candidate speaks
+          stopAllAudioRef.current?.();
+          setCandidateCaption(candidateText);
+          setIsCandidateSpeaking(true);
+
+          if (silenceTimerRef.current) {
+            clearTimeout(silenceTimerRef.current);
+            silenceTimerRef.current = null;
+          }
+
+          if (final && final.trim().length >= 2) {
+            setIsCandidateSpeaking(false);
+            handleProcessCandidateMessageRef.current?.(final.trim());
+          } else {
+            silenceTimerRef.current = setTimeout(() => {
+              if (candidateText.trim().length >= 2 && !isBusyProcessingRef.current) {
+                setIsCandidateSpeaking(false);
+                handleProcessCandidateMessageRef.current?.(candidateText.trim());
+              }
+            }, 800);
+          }
+        }
+      };
+
+      recognition.onerror = (e: any) => {
+        console.warn("Speech recognition notice:", e?.error);
+        setIsCandidateSpeaking(false);
+        if (e?.error === "not-allowed" || e?.error === "service-not-allowed") {
+          setSpeechError("Microphone permission was denied. Please allow microphone in your browser URL bar.");
+          shouldListenRef.current = false;
+          setIsListening(false);
+        }
+      };
+
+      recognition.onend = () => {
+        setIsListening(false);
+        // Automatically restart for continuous conversation without buffering latency
+        if (shouldListenRef.current && isMountedRef.current && !isBusyProcessingRef.current) {
+          if (restartTimerRef.current) clearTimeout(restartTimerRef.current);
+          restartTimerRef.current = setTimeout(() => {
+            startRecognitionSession();
+          }, 150);
+        }
+      };
+
+      recognitionRef.current = recognition;
+      recognition.start();
+    } catch (err: any) {
+      console.warn("Recognition start notice:", err);
     }
   }, []);
 
-  const stopListening = useCallback(() => {
+  const stopRecognitionSession = useCallback(() => {
     shouldListenRef.current = false;
     if (restartTimerRef.current) {
       clearTimeout(restartTimerRef.current);
@@ -489,10 +771,14 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({
     }
     if (recognitionRef.current) {
       try {
-        recognitionRef.current.stop();
+        recognitionRef.current.onstart = null;
+        recognitionRef.current.onresult = null;
+        recognitionRef.current.onerror = null;
+        recognitionRef.current.onend = null;
+        recognitionRef.current.abort();
       } catch {}
+      recognitionRef.current = null;
     }
-    isRecognizingRef.current = false;
     setIsListening(false);
   }, []);
 
@@ -501,113 +787,20 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({
     if (!hasStarted) return;
 
     if (!micEnabled) {
-      stopListening();
+      stopRecognitionSession();
       return;
     }
 
     shouldListenRef.current = true;
-
-    const SpeechRecognition =
-      (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-
-    if (!SpeechRecognition) {
-      console.warn("SpeechRecognition not supported in this browser.");
-      setSpeechError("Speech recognition not supported in your browser. You can type in the box below.");
-      return;
-    }
-
-    const recognition = new SpeechRecognition();
-    recognition.continuous = true;
-    recognition.interimResults = true;
-    recognition.maxAlternatives = 1;
-    recognition.lang =
-      typeof navigator !== "undefined" && navigator.language ? navigator.language : "en-US";
-
-    recognition.onstart = () => {
-      isRecognizingRef.current = true;
-      setIsListening(true);
-      setSpeechError(null);
-    };
-
-    recognition.onresult = (event: any) => {
-      if (isBusyProcessingRef.current) return;
-
-      let interim = "";
-      let final = "";
-
-      for (let i = event.resultIndex; i < event.results.length; ++i) {
-        const transcript = event.results[i][0].transcript;
-        if (event.results[i].isFinal) {
-          final += transcript;
-        } else {
-          interim += transcript;
-        }
-      }
-
-      const candidateText = (final || interim).trim();
-      if (candidateText && candidateText.length >= 2) {
-        // If candidate speaks, instantly silence AI
-        stopAllAudioRef.current?.();
-
-        setCandidateCaption(candidateText);
-        setIsCandidateSpeaking(true);
-
-        if (silenceTimerRef.current) {
-          clearTimeout(silenceTimerRef.current);
-          silenceTimerRef.current = null;
-        }
-
-        if (final && final.trim().length >= 2) {
-          setIsCandidateSpeaking(false);
-          handleProcessCandidateMessageRef.current?.(final.trim());
-        } else {
-          // 850ms silence-debounce allows natural conversational pauses
-          silenceTimerRef.current = setTimeout(() => {
-            if (candidateText.trim().length >= 2 && !isBusyProcessingRef.current) {
-              setIsCandidateSpeaking(false);
-              handleProcessCandidateMessageRef.current?.(candidateText.trim());
-            }
-          }, 850);
-        }
-      }
-    };
-
-    recognition.onerror = (e: any) => {
-      console.warn("Speech recognition notice:", e?.error);
-      setIsCandidateSpeaking(false);
-
-      if (e?.error === "language-not-supported") {
-        recognition.lang = "en-US";
-      } else if (e?.error === "not-allowed" || e?.error === "service-not-allowed") {
-        setSpeechError("Microphone permission was denied. Please allow microphone in browser address bar.");
-        shouldListenRef.current = false;
-        setIsListening(false);
-      }
-      // On non-fatal errors like 'no-speech' or 'audio-capture', onend will fire and restart safely
-    };
-
-    recognition.onend = () => {
-      isRecognizingRef.current = false;
-      setIsListening(false);
-
-      if (shouldListenRef.current && isMountedRef.current && micEnabled) {
-        if (restartTimerRef.current) clearTimeout(restartTimerRef.current);
-        restartTimerRef.current = setTimeout(() => {
-          startListening();
-        }, 200);
-      }
-    };
-
-    recognitionRef.current = recognition;
-    startListening();
+    startRecognitionSession();
 
     return () => {
-      stopListening();
+      stopRecognitionSession();
       if (silenceTimerRef.current) {
         clearTimeout(silenceTimerRef.current);
       }
     };
-  }, [hasStarted, micEnabled, startListening, stopListening]);
+  }, [hasStarted, micEnabled, startRecognitionSession, stopRecognitionSession]);
 
   // Start Meeting Handler
   const handleStartMeeting = async () => {
@@ -663,8 +856,13 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({
       if (localStreamRef.current) {
         localStreamRef.current.getTracks().forEach((t) => t.stop());
       }
-      if (livekitRoomRef.current && livekitRoomRef.current.state === ConnectionState.Connected) {
-        livekitRoomRef.current.disconnect();
+      if (livekitRoomRef.current) {
+        try {
+          if (livekitRoomRef.current.state === ConnectionState.Connected) {
+            livekitRoomRef.current.disconnect();
+          }
+        } catch {}
+        livekitRoomRef.current = null;
       }
     };
   }, [stopAllAudio]);
@@ -691,9 +889,9 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({
     }
     if (nextState) {
       shouldListenRef.current = true;
-      startListening();
+      startRecognitionSession();
     } else {
-      stopListening();
+      stopRecognitionSession();
     }
   };
 
@@ -789,7 +987,11 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({
                   />
                 </div>
                 <span className="text-[10px] text-emerald-400 font-bold uppercase tracking-wider">
-                  {isCandidateSpeaking || audioLevel > 15
+                  {isTranscribing
+                    ? "Transcribing..."
+                    : isManualRecording
+                    ? "Recording..."
+                    : isCandidateSpeaking || audioLevel > 15
                     ? "Speaking"
                     : isListening
                     ? "Listening"
@@ -931,16 +1133,45 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({
           )}
         </div>
 
-        {/* Text Fallback Input */}
+        {/* Voice & Text Input Form */}
         <form onSubmit={handleManualTextSubmit} className="flex-1 max-w-lg flex items-center gap-2 w-full">
-          <input
-            type="text"
-            placeholder="Speak aloud or type your counter-offer / justification here..."
-            value={textInput}
-            onChange={(e) => setTextInput(e.target.value)}
-            disabled={isProcessing}
-            className="flex-1 px-4 py-2.5 rounded-2xl border border-slate-300 text-xs text-slate-900 placeholder:text-slate-500 font-medium focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 bg-white shadow-xs"
-          />
+          <div className="relative flex-1 flex items-center">
+            <input
+              type="text"
+              placeholder={isListening ? "Listening... Speak your counter-offer or type here" : "Speak aloud or type your counter-offer here..."}
+              value={textInput}
+              onChange={(e) => setTextInput(e.target.value)}
+              disabled={isProcessing}
+              className={`w-full pl-4 pr-10 py-2.5 rounded-2xl border text-xs text-slate-900 placeholder:text-slate-500 font-medium focus:outline-none focus:ring-2 focus:ring-blue-500/20 bg-white shadow-xs transition ${
+                isCandidateSpeaking ? "border-emerald-500 ring-2 ring-emerald-500/20" : "border-slate-300 focus:border-blue-500"
+              }`}
+            />
+            <button
+              type="button"
+              onClick={() => {
+                if (isManualRecording || isRecordingVoiceRef.current) {
+                  stopVoiceRecording();
+                } else {
+                  setIsManualRecording(true);
+                  startVoiceRecording();
+                  shouldListenRef.current = true;
+                  startRecognitionSession();
+                }
+              }}
+              title={isManualRecording ? "Recording... Click to stop and send" : "Click to record voice"}
+              className={`absolute right-2 p-1.5 rounded-xl transition ${
+                isManualRecording
+                  ? "text-rose-600 bg-rose-100 animate-pulse ring-2 ring-rose-500"
+                  : isTranscribing
+                  ? "text-amber-600 bg-amber-100 animate-pulse"
+                  : isListening
+                  ? "text-emerald-600 bg-emerald-50"
+                  : "text-slate-400 hover:text-slate-600"
+              }`}
+            >
+              <Mic className="w-4 h-4" />
+            </button>
+          </div>
           <button
             type="submit"
             disabled={isProcessing || !textInput.trim()}

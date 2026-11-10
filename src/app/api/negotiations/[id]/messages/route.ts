@@ -167,6 +167,8 @@ export async function POST(
     const responsePayload: any = {
       action: decision.action,
       message: sanitizedAgentMessage,
+      currentOffer: state.currentOffer,
+      requiresApproval: Boolean(state.humanApprovalNeeded),
     };
     if (decision.counterOffer !== undefined) {
       responsePayload.counterOffer = decision.counterOffer;

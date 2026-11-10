@@ -33,12 +33,22 @@ function CandidateNegotiationContent({ params }: PageProps) {
   const loadData = async () => {
     try {
       const data = await getNegotiationPublic(id);
-      setState(data);
-      if (data.status === "completed") {
-        setIsCompleted(true);
+      if (data && data.candidate) {
+        setState(data);
+        if (data.status === "completed") {
+          setIsCompleted(true);
+        }
+        setError(null);
       }
     } catch (err: any) {
-      setError(err.message || "Failed to load negotiation session.");
+      // Only set fatal error if meeting has never loaded; don't tear down active calls on poll hiccups
+      setState((prev: any) => {
+        if (!prev) {
+          setError(err.message || "Failed to load negotiation session.");
+        }
+        return prev;
+      });
+      console.warn("Negotiation sync notice:", err?.message);
     } finally {
       setLoading(false);
     }
